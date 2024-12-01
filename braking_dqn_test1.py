@@ -38,6 +38,7 @@ import weakref
 import time
 import numpy as np
 import cv2
+
 from collections import deque
 from keras.applications.xception import Xception 
 from keras.optimizers import Adam
@@ -46,7 +47,7 @@ from keras.callbacks import TensorBoard
 
 from keras.models import Sequential, Model, load_model
 from keras.layers import AveragePooling2D, Conv2D, Activation, Flatten, GlobalAveragePooling2D, Dense, Concatenate, Input
-
+from keras.applications.resnet50 import preprocess_input, ResNet50
 
 #from tensorboard import *
 
@@ -139,6 +140,12 @@ class ModifiedTensorBoard(TensorBoard):
             self.writer.flush()  
                 
 
+def get_rgb_from_camera_sensor(car_env):
+    # Convert depth image to array of depth values
+    rgb_array = np.frombuffer(car_env.rgb.raw_data, dtype=np.dtype("uint8"))
+    rgb_array = np.reshape(rgb_array, (car_env.rgb.height, car_env.rgb.width, 4))
+    rgb_array = rgb_array[:,:,:-1].astype(np.float32)
+    return rgb_array
 
 '''
 Defining the Carla Environment Class. 
@@ -192,7 +199,7 @@ class CarEnv:
         
         print("Spawning my agent.....")
 
-        # to use the RGB camera
+        # to use the depth camera
         self.depth_camera = self.blueprint_library.find("sensor.camera.depth")
         #self.depth_camera.set_attribute('image_type', 'Depth')
         self.depth_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
@@ -228,6 +235,20 @@ class CarEnv:
         self.seg_camera_sensor.listen(lambda data: self.image_seg(data))
         #print("In RESET FUNCTION after processing SEGMENTATION IMAGE")
         #print()
+
+        '''
+        To spawn the RGB Camera
+        '''
+        self.rgb_camera = self.blueprint_library.find("sensor.camera.rgb")
+        self.rgb_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
+        self.rgb_camera.set_attribute("image_size_y", f"{IM_HEIGHT}")
+        self.rgb_camera.set_attribute("fov", "40")
+        self.rgb_camera_spawn_point = carla.Transform(carla.Location(x=2, y=0, z=1.4), Rotation(yaw=0))
+        # to spawn the camera
+        self.rgb_camera_sensor = self.world.spawn_actor(self.rgb_camera, self.rgb_camera_spawn_point, attach_to = self.vehicle)
+        #print("Segmentation camera image sent for processing....")
+        self.actor_list.append(self.rgb_camera_sensor)
+        self.rgb_camera_sensor.listen(lambda data: self.image_rgb(data))
         
 
         # to initialize the car quickly and get it going
@@ -264,11 +285,13 @@ class CarEnv:
             
         self.process_images()
 
+        rgb_array = get_rgb_from_camera_sensor(self)
+
         self.episode_start = time.time()
 
         self.vehicle.apply_control(carla.VehicleControl(throttle = 1.0, brake = 0.0))
 
-        return [(self.distance-300)/300, -1]
+        return [(self.distance-300)/300, -1, rgb_array]
 
     
     # to record the collision data
@@ -281,6 +304,10 @@ class CarEnv:
         self.lanecrossing_history.append(event)
         print("Lane crossing history: ", event)
         
+
+    def image_rgb(self, image):
+        self.rgb = image
+
 
     def image_dep(self, image):
         self.cam = image
@@ -403,7 +430,8 @@ class CarEnv:
         
         dist_from_goal = np.sqrt((pos.x - self.final_destination[0])**2 + (pos.y-self.final_destination[1])**2)
 
-        self.process_images() 
+        self.process_images()
+        rgb_array = get_rgb_from_camera_sensor(self) 
         
         done = False
 
@@ -452,7 +480,7 @@ class CarEnv:
 
         print(reward)
 
-        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300], reward, done, waypoint
+        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300, rgb_array], reward, done, waypoint
     
             
     def trajectory(self, draw = False):
@@ -494,9 +522,17 @@ class CarEnv:
 To define the Deep Q Network Agent
 '''
 class DQNAgent:
+
+    FEATURES = 2048
+    CNN_INPUT_SIZE = (224,224)
+
     def __init__(self):
         #self.model = load_model(MODEL_PATH)
         #self.target_model = load_model(MODEL_PATH)
+        # Load the CNN
+        resnet = ResNet50(weights='imagenet')
+        self.cnn_encoder = Model(inputs=resnet.input, outputs=resnet.get_layer('avg_pool').output)
+        # Load Model
         self.model = self.create_model()
         self.target_model = self.create_model()
         self.target_model.set_weights(self.model.get_weights())
@@ -517,9 +553,9 @@ class DQNAgent:
 
     def create_model(self):
         # define the model
-        model3 = Sequential()
-        model3.add(Dense(2, input_shape=(2,), activation='linear', name='dense1'))
-        combined_model = Model(inputs=model3.input, outputs=model3.output)
+        dqn_model = Sequential()
+        dqn_model.add(Dense(2, input_shape=(DQNAgent.FEATURES+1,), activation='linear', name='dense1'))
+        combined_model = Model(inputs=dqn_model.input, outputs=dqn_model.output)
         
         # compile the model
         combined_model.compile(loss='mse', optimizer=Adam(lr=0.0001), metrics=['accuracy'])
@@ -586,14 +622,23 @@ class DQNAgent:
 
     
     def get_qs(self, state):
-        return self.model.predict(np.array(state).reshape(-1, *np.array(state).shape))[0]
+        _, velocity = state[:-1]
+        rgb_image = state[-1]
+        # Preprocess RGB image
+        rgb_image = cv2.resize(rgb_image, DQNAgent.CNN_INPUT_SIZE)
+        rgb_image = np.expand_dims(rgb_image, axis=0)
+        x = preprocess_input(rgb_image)
+        # Get features from the CNN
+        cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)
+        dqn_input = np.concatenate((cnn_output, [[velocity]]), axis=1)
+        return self.model.predict(dqn_input)[0]
 
     
     def train_in_loop(self):
-        X2 = np.random.uniform(size=(1, 2)).astype(np.float32)
+        X2 = np.random.uniform(size=(1, DQNAgent.FEATURES+1)).astype(np.float32)
         y = np.random.uniform(size=(1, 2)).astype(np.float32)
         with self.graph.as_default():
-            self.model.fit(X2,y, verbose=False, batch_size=1)
+            self.model.fit(X2, y, verbose=False, batch_size=1)
 
         self.training_initialized = True
 
@@ -633,7 +678,6 @@ if __name__ == '__main__':
     agent = DQNAgent()
     env = CarEnv()
 
-
     # Start training thread and wait for training to be initialized
     trainer_thread = Thread(target=agent.train_in_loop, daemon=True)
     trainer_thread.start()
@@ -641,7 +685,7 @@ if __name__ == '__main__':
         time.sleep(0.01)
     # Initialize predictions - first prediction takes longer as of initialization that has to be done
     # It's better to do a first prediction then before we start iterating over episode steps
-    agent.get_qs([-1, -1])
+    #agent.get_qs([-1, -1])
     
 
     # Connect to the Carla simulator

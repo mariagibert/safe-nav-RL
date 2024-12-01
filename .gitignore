@@ -1,0 +1,10 @@
+# ignore ALL .log files
+*.log
+*.png
+*.pyc 
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+.vscode/
+
+# ignore ALL files in ANY directory named temp
