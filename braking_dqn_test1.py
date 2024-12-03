@@ -626,7 +626,7 @@ class DQNAgent:
         rgb_image = state[-1]
         # Preprocess RGB image
         rgb_image = cv2.resize(rgb_image, DQNAgent.CNN_INPUT_SIZE)
-        rgb_image = np.expand_dims(rgb_image, axis=0)
+        rgb_image = np.expand_dims(rgb_image, axis=0) # /  255.0
         x = preprocess_input(rgb_image)
         # Get features from the CNN
         cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)

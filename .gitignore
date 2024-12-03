@@ -2,6 +2,7 @@
 *.log
 *.png
 *.pyc 
+*.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
