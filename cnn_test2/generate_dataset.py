@@ -4,6 +4,7 @@ import time
 import numpy as np
 import math
 import json
+import random
 import cv2
 
 from pathlib import Path
@@ -24,19 +25,22 @@ town2 = {
     1: {1: [80, 306.6, 5, 0], 2:[135.25,206]}, # trajectory 1
     2: {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}, # trajectory 2
     3: {1: [-7.498, 165.809, 5, 90], 2:[81.98,241.954]}, # trajectory 3
-    4: {1: [106.411, 191.63, 5, 0], 2:[170.551,240.054]} # trajectory 4
+    4: {1: [106.411, 191.63, 5, 0], 2:[170.551,240.054]}, # trajectory 4
+    5: {1: [135.25,206, 5, 0], 2:[80, 306.6]},
+    6: {1: [81.98, 241.954, 5, 90], 2:[-7.498, 284.716]},
+    7: {1: [81.98,241.954, 5, 90], 2:[-7.498, 165.809]},
+    8: {1: [170.551,240.054, 5, 0], 2:[106.411, 191.63]}
 }
+
 IM_WIDTH = 640
 IM_HEIGHT = 480
-
 
 class CarEnv:
 
     STEER_AMT = 1.0   # actions that the agent can take [-1, 0, 1] --> [turn left, go straight, turn right]
     front_camera = None
 
-
-    def __init__(self, trajectory, save_root):
+    def __init__(self, save_root):
         # to initialize
         self.client = carla.Client("localhost", 2000)
         self.client.set_timeout(20.0)
@@ -48,8 +52,6 @@ class CarEnv:
         self.crossing = 0
         self.curves = 1
         self.reached = 0
-        self.start = town2[trajectory][1]
-        self.traj = trajectory
         self.actor_list = []
         self.save_root = save_root
         self.tick=0
@@ -57,13 +59,18 @@ class CarEnv:
     def image_dep(self, image):
         self.cam = image
         
-
     def image_seg(self, image):
         self.seg = image
-        
+    
+    def collision_data(self, event):
+        self.collision_history.append(event)
+    
+    def set_spawn_point_and_trajectory(self):
+        random_trajectory = random.choice(list(town2.keys()))
+        self.start = town2[random_trajectory][1]
+        self.traj = random_trajectory
 
     def iniciate_agent_with_sensors(self):
-
         '''
         To spawn the Vehicle (agent)
         '''
@@ -114,12 +121,23 @@ class CarEnv:
         for el in traj:
             self.path.append(el[0])
 
+        '''
+        To spawn the collision sensor
+        '''
+        # to introduce the collision sensor to detect what type of collision is happening
+        col_sensor = self.blueprint_library.find("sensor.other.collision")
+        
+        # keeping the location of the sensor to be same as that of the RGB camera
+        self.collision_sensor = self.world.spawn_actor(col_sensor, self.camera_spawn_point, attach_to = self.vehicle)
+        self.actor_list.append(self.collision_sensor)
+
+        # to record the data from the collision sensor
+        self.collision_sensor.listen(lambda event: self.collision_data(event))
+        self.collision_history = []
+
 
     def start_driving(self):
-
-
         self.vehicle.set_autopilot(True)
-
 
     def capture_data(self):
 
@@ -137,8 +155,6 @@ class CarEnv:
         with open(str(self.save_root / f'{str(self.tick).zfill(5)}_data.json'), 'w') as file:
             json.dump({'phi': phi, 'dobs': dis, 'dc': dc}, file)
 
-
-    # to process the image
     def process_images(self):        
         # Convert depth image to array of depth values
         depth_array1 = np.frombuffer(self.cam.raw_data, dtype=np.dtype("uint8"))
@@ -201,7 +217,7 @@ class CarEnv:
         pos = self.vehicle.get_transform().location
         rot = self.vehicle.get_transform().rotation
         
-       # to get the closest waypoint to the car
+        # to get the closest waypoint to the car
         waypoint = self.client.get_world().get_map().get_waypoint(pos, project_to_road=True)
         waypoint_ind = self.get_closest_waypoint(self.path, waypoint) + 1
         waypoint = self.path[waypoint_ind]
@@ -272,21 +288,27 @@ class CarEnv:
 if __name__ == '__main__':
     save_root = Path('/home/ubuntu/mgibert/Development/safe-nav-RL/cnn_test2/test2_dataset')
     save_root.mkdir(exist_ok=True, parents=True)
+    max_dataset_items = 100
+    env = CarEnv(save_root=save_root)
 
-    env = CarEnv(1, save_root=save_root)
-
-    try:
-        env.iniciate_agent_with_sensors()
-
-        env.start_driving()
-
-        while env.tick < 5:
-            env.capture_data()
-            env.world.tick()
-            env.tick += 1
-            time.sleep(10)
-
-    finally:    
-        for actor in env.actor_list:
-            actor.destroy()
+    while env.tick < max_dataset_items:
+        try:
+            env.set_spawn_point_and_trajectory()
+            print(env.traj)
+            env.iniciate_agent_with_sensors()
+            print('Start')
+            env.start_driving()
+            while len(env.collision_history) == 0 and env.tick < max_dataset_items:
+                env.capture_data()
+                env.world.tick()
+                env.tick += 1
+                print('Collected')
+                time.sleep(3)
+            for actor in env.actor_list:
+                actor.destroy()
+            env.actor_list = []
+            print("All actors have been killed")
+        except:
+            for actor in env.actor_list:
+                actor.destroy()
             print("All actors have been killed")

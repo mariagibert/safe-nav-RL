@@ -621,7 +621,7 @@ if __name__ == '__main__':
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
     backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
-    path = r"/home/ubuntu/mgibert/Development/models/test1/"
+    path = r"/home/ubuntu/mgibert/Development/models/test0"
     
     fps_counter = deque(maxlen=60)
     
@@ -758,7 +758,7 @@ if __name__ == '__main__':
     
                 # Save model, but only when min reward is greater or equal a set value
                 if min_reward >= MIN_REWARD:
-                    agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+                    agent.model.save(f'{path}/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
     
             # Decay epsilon
             if epsilon > MIN_EPSILON:

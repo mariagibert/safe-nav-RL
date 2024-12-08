@@ -63,8 +63,8 @@ IM_WIDTH = 640
 IM_HEIGHT = 480
 SECONDS_PER_EPISODE = 20
 REPLAY_MEMORY_SIZE = 5_000
-MIN_REPLAY_MEMORY_SIZE = 1_000
-MINIBATCH_SIZE = 16
+MIN_REPLAY_MEMORY_SIZE = 500 #1_000
+MINIBATCH_SIZE = 16 # 16
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
 UPDATE_TARGET_EVERY = 2
@@ -138,14 +138,6 @@ class ModifiedTensorBoard(TensorBoard):
                 if self.model is not None:
                     self.writer.add_graph(sess.graph, global_step=index)
             self.writer.flush()  
-                
-
-def get_rgb_from_camera_sensor(car_env):
-    # Convert depth image to array of depth values
-    rgb_array = np.frombuffer(car_env.rgb.raw_data, dtype=np.dtype("uint8"))
-    rgb_array = np.reshape(rgb_array, (car_env.rgb.height, car_env.rgb.width, 4))
-    rgb_array = rgb_array[:,:,:-1].astype(np.float32)
-    return rgb_array
 
 '''
 Defining the Carla Environment Class. 
@@ -177,10 +169,27 @@ class CarEnv:
         self.distance = None
         self.cam = None
         self.seg = None
+
+        # Load the CNN
+        resnet = ResNet50(weights='imagenet')
+        self.cnn_encoder = Model(inputs=resnet.input, outputs=resnet.get_layer('avg_pool').output)
         
 
-    def reset(self):
+    def get_features_from_camera_sensor(self):
+        # Convert depth image to array of depth values
+        rgb_array = np.frombuffer(self.rgb.raw_data, dtype=np.dtype("uint8"))
+        rgb_array = np.reshape(rgb_array, (self.rgb.height, self.rgb.width, 4))
+        rgb_array = rgb_array[:,:,:-1].astype(np.float32)
+        # Preprocess RGB image
+        rgb_array = cv2.resize(rgb_array, DQNAgent.CNN_INPUT_SIZE)
+        rgb_array = np.expand_dims(rgb_array, axis=0) # /  255.0
+        x = preprocess_input(rgb_array)
+        # Get features from the CNN
+        cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)
+        return cnn_output
 
+
+    def reset(self):
         # store any collision detected
         self.collision_history = []
         # to store all the actors that are present in the environment
@@ -284,14 +293,13 @@ class CarEnv:
             time.sleep(0.01)
             
         self.process_images()
-
-        rgb_array = get_rgb_from_camera_sensor(self)
+        features = self.get_features_from_camera_sensor()
 
         self.episode_start = time.time()
 
         self.vehicle.apply_control(carla.VehicleControl(throttle = 1.0, brake = 0.0))
 
-        return [(self.distance-300)/300, -1, rgb_array]
+        return [(self.distance-300)/300, -1, features]
 
     
     # to record the collision data
@@ -325,7 +333,7 @@ class CarEnv:
         depth_array1 = depth_array1.astype(np.int32)
         
         # Using this formula to get the distances
-        depth_map = (depth_array1[:, :, 0]*255*255 + depth_array1[:, :, 1]*255 + depth_array1[:, :, 2])/1000
+        depth_map = (depth_array1[:, :, 0]*256*256 + depth_array1[:, :, 1]*256 + depth_array1[:, :, 2])/1000
         
         # Making the sky at 0 distance
         x = np.where(depth_map >= 16646.655)
@@ -431,10 +439,9 @@ class CarEnv:
         dist_from_goal = np.sqrt((pos.x - self.final_destination[0])**2 + (pos.y-self.final_destination[1])**2)
 
         self.process_images()
-        rgb_array = get_rgb_from_camera_sensor(self) 
+        features = self.get_features_from_camera_sensor()
         
         done = False
-
 
         '''
         TO DEFINE THE REWARDS
@@ -480,7 +487,7 @@ class CarEnv:
 
         print(reward)
 
-        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300, rgb_array], reward, done, waypoint
+        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300, features], reward, done, waypoint
     
             
     def trajectory(self, draw = False):
@@ -529,9 +536,6 @@ class DQNAgent:
     def __init__(self):
         #self.model = load_model(MODEL_PATH)
         #self.target_model = load_model(MODEL_PATH)
-        # Load the CNN
-        resnet = ResNet50(weights='imagenet')
-        self.cnn_encoder = Model(inputs=resnet.input, outputs=resnet.get_layer('avg_pool').output)
         # Load Model
         self.model = self.create_model()
         self.target_model = self.create_model()
@@ -576,12 +580,20 @@ class DQNAgent:
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
         # to normalize the image
-        current_data = np.array([[transition[0][i] for i in range(2)] for transition in minibatch])
+        current_data = []
+        for transition in minibatch:
+            _, velocity, features = transition[0]
+            current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
+        current_data = np.array(current_data)
         # predicting all the datapoints present in the mini-batch
         with self.graph.as_default():
             current_qs_list = self.model.predict(current_data, PREDICTION_BATCH_SIZE)
 
-        new_current_data = np.array([[transition[3][i] for i in range(2)] for transition in minibatch])
+        new_current_data = []
+        for transition in minibatch:
+            _, velocity, features = transition[3]
+            new_current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
+        new_current_data = np.array(new_current_data)
         with self.graph.as_default():
             future_qs_list = self.target_model.predict(new_current_data, PREDICTION_BATCH_SIZE)
 
@@ -599,7 +611,8 @@ class DQNAgent:
             current_qs = current_qs_list[index]
             current_qs[action] = new_q
 
-            X_data.append([current_state[i] for i in range(2)])
+            _, velocity, features = current_state
+            X_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
             y.append(current_qs)
 
         log_this_step = False
@@ -622,15 +635,8 @@ class DQNAgent:
 
     
     def get_qs(self, state):
-        _, velocity = state[:-1]
-        rgb_image = state[-1]
-        # Preprocess RGB image
-        rgb_image = cv2.resize(rgb_image, DQNAgent.CNN_INPUT_SIZE)
-        rgb_image = np.expand_dims(rgb_image, axis=0) # /  255.0
-        x = preprocess_input(rgb_image)
-        # Get features from the CNN
-        cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)
-        dqn_input = np.concatenate((cnn_output, [[velocity]]), axis=1)
+        _, velocity, features = state
+        dqn_input = np.concatenate((features, [[velocity]]), axis=1)
         return self.model.predict(dqn_input)[0]
 
     
@@ -645,7 +651,10 @@ class DQNAgent:
         while True:
             if self.terminate:
                 return
-            self.train()
+            try:
+                self.train()
+            except Exception as e:
+                print(f'Error Happened!!!!!: {e}')
             time.sleep(0.01)
 
            
@@ -666,7 +675,7 @@ if __name__ == '__main__':
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
     backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
-    path = r"/home/ubuntu/mgibert/Development/models/test1/"
+    path = r"/home/ubuntu/mgibert/Development/models/test1"
     
     fps_counter = deque(maxlen=60)
     
@@ -685,7 +694,7 @@ if __name__ == '__main__':
         time.sleep(0.01)
     # Initialize predictions - first prediction takes longer as of initialization that has to be done
     # It's better to do a first prediction then before we start iterating over episode steps
-    #agent.get_qs([-1, -1])
+    agent.get_qs([-1, -1, np.ones((1, DQNAgent.FEATURES))*-1])
     
 
     # Connect to the Carla simulator
@@ -699,7 +708,6 @@ if __name__ == '__main__':
 
     # to wait for the agent to spawn and start moving
     time.sleep(5)
-
 
     '''
     Iterate over the episodes
@@ -802,7 +810,7 @@ if __name__ == '__main__':
     
                 # Save model, but only when min reward is greater or equal a set value
                 if min_reward >= MIN_REWARD:
-                    agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+                    agent.model.save(f'{path}/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
     
             # Decay epsilon
             if epsilon > MIN_EPSILON:

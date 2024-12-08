@@ -213,7 +213,7 @@ class CarEnv:
         # self.rgb_camera.set_attribute("image_size_y", f"{IM_HEIGHT}")
         # self.rgb_camera.set_attribute("fov", f"110")
 
-        # self.camera_spawn_point = carla.Transform(carla.Location(x=2, y=0, z=1.4))
+        self.camera_spawn_point = carla.Transform(carla.Location(x=2, y=0, z=1.4))
 
         # # to spawn the camera
         # self.camera_sensor = self.world.spawn_actor(self.rgb_camera, self.camera_spawn_point, attach_to = self.vehicle)
@@ -673,7 +673,7 @@ if __name__ == '__main__':
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
     backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
-    path = r"/home/tejas/Documents/Stanford/CS 238/Final Project/Stanford-CS-238/Stanford-CS-238/Stanford-CS-238/models"
+    path = r"/home/ubuntu/mgibert/Development/models/test1/"
     
     # Create models folder
     if not os.path.isdir(path):

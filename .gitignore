@@ -7,5 +7,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
 .vscode/
+logs/
 
 # ignore ALL files in ANY directory named temp
