@@ -11,6 +11,8 @@ import carla
 from carla import Transform 
 from carla import Location
 from carla import Rotation
+import json
+import math
 
 
 
@@ -18,13 +20,14 @@ town2 = {1: [80, 306.6, 5, 0], 2:[150,306.6]}
 curves = [0, town2]
 
 epsilon = 0
-MODEL_PATH = 'models/Braking__1974.00max_-4003.20avg_-12751.00min__1678788336.model'
 
-#MODEL_PATH = 'models/Drive__1179.00max_-2267.50avg_-4772.00min__1678751492.model'
+MODEL_PATH = '/home/ubuntu/mgibert/Development/models/test0/Braking___526.00max__526.00avg__526.00min__1733657613.model'
 
-MODEL_PATH = 'models/Braking___387.00max__387.00avg__387.00min__1679115477.model'
-
-MODEL_PATH = "models/Braking___337.00max__337.00avg__337.00min__1679252221.model"
+def calculate_distance(point1, point2):
+    x1, y1 = point1.x, point1.y
+    x2, y2 = point2
+    distance = math.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+    return distance
 
 
 if __name__ == '__main__':
@@ -46,20 +49,41 @@ if __name__ == '__main__':
     # Initialize predictions - first prediction takes longer as of initialization that has to be done
     # It's better to do a first prediction then before we start iterating over episode steps
     model.predict(np.array([[0,0]]))
+
+    # Connect to the Carla simulator
+    client = carla.Client('localhost', 2000)
+    client.set_timeout(20.0)
+    world = client.get_world()
+
+    # Spawn a vehicle in the world
+    blueprint_library = world.get_blueprint_library()
+    vehicle_bp = blueprint_library.find('vehicle.mini.cooper_s')
+
+    number_of_episodes = 10
+    evaluation = {
+        "reward": [],
+        "time": [],
+        "path_distance": [],
+        "collisions": []
+    }
+
     
     # Loop over episodes
-    for i in range(1):
+    for i in range(number_of_episodes):
 
         print('Restarting episode')
+        episode_reward = []
 
-        #actor_list = []
-        #front_car_pos = np.random.randint(90,130)
-        #spawn_point = carla.Transform(Location(x=front_car_pos, y=306.886, z=5), Rotation(yaw=0))
-        #vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-        #actor_list.append(vehicle)
+        actor_list = []
+        front_car_pos = np.random.randint(90,130)
+        spawn_point = carla.Transform(Location(x=front_car_pos, y=306.886, z=5), Rotation(yaw=0))
+        vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+        actor_list.append(vehicle)
         #print("direction: ", direction)
         env.waypoint = env.client.get_world().get_map().get_waypoint(Location(x=curves[env.curves][1][0], y=curves[env.curves][1][1], z=curves[env.curves][1][2]), project_to_road=True)
         
+        start_time = time.time()
+
         # Reset environment and get initial state
         current_state = env.reset()
         env.collision_hist = []
@@ -91,6 +115,7 @@ if __name__ == '__main__':
                 time.sleep(sum(fps_counter)/len(fps_counter))
             # Step environment (additional flag informs environment to not break an episode by time limit)
             new_state, reward, done, waypoint = env.step(action, current_state)
+            episode_reward.append(reward)
 
             # Set current step for next loop iteration
             current_state = new_state
@@ -98,6 +123,7 @@ if __name__ == '__main__':
 
             # If done - agent crashed, break an episode
             if done:
+                end_time = time.time()
                 break
 
             # Measure step time, append to a deque, then print mean FPS for last 60 frames, q values and taken action
@@ -105,9 +131,19 @@ if __name__ == '__main__':
             fps_counter.append(frame_time)
             print(f'Agent: {len(fps_counter)/sum(fps_counter):>4.1f} FPS | Action: [{qs[0]:>5.2f}, {qs[1]:>5.2f}] {action}')
 
+        # save data in order to evaluate model
+        evaluation["reward"].append(sum(episode_reward))
+        evaluation["time"].append(end_time - start_time)
+        evaluation["collisions"].append([collision.other_actor.type_id for collision in env.collision_history])
+        evaluation["path_distance"].append(calculate_distance(env.vehicle.get_transform().location, town2[1][:2])) 
+        
+        
         # Destroy an actor at end of episode
         for actor in env.actor_list:
             actor.destroy()
             
-        #for actor in actor_list:
-            #actor.destroy()
+        for actor in actor_list:
+            actor.destroy()
+    
+    with open('/home/ubuntu/mgibert/Development/models/test0/evaluation.json', 'w') as file:
+        json.dump(evaluation, file)
