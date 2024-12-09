@@ -19,7 +19,7 @@ from agents.navigation.global_route_planner import GlobalRoutePlanner
 town2 = {1: [80, 306.6, 5, 0], 2:[135.25,206]} 
 
 #Trajectory 2
-town2 = {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}
+#town2 = {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}
 
 #Trajectory 3
 #town2 = {1: [-7.498, 165.809, 5, 90], 2:[81.98,241.954]}
@@ -32,9 +32,9 @@ town2 = {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}
 
 
 # to load the pretrained models for braking and driving
-MODEL_PATH = "models/Braking___337.00max__337.00avg__337.00min__1679252221.model"
+MODEL_PATH = "/home/ubuntu/mgibert/Development/models/test0/Braking___526.00max__526.00avg__526.00min__1733657613.model"
 
-MODEL_PATH2 = "models/Driving__6030.00max_6030.00avg_6030.00min__1679109656.model"
+MODEL_PATH2 = "/home/ubuntu/mgibert/Development/models/test0/Driving__4667.00max_4667.00avg_4667.00min__1733761661.model"
 
 
 
