@@ -10,7 +10,7 @@ import cv2
 from pathlib import Path
 
 import sys
-sys.path.append(str(Path(__file__).parents[1]))
+sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
@@ -26,10 +26,12 @@ town2 = {
     2: {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}, # trajectory 2
     3: {1: [-7.498, 165.809, 5, 90], 2:[81.98,241.954]}, # trajectory 3
     4: {1: [106.411, 191.63, 5, 0], 2:[170.551,240.054]}, # trajectory 4
-    5: {1: [135.25,206, 5, 0], 2:[80, 306.6]},
-    6: {1: [81.98, 241.954, 5, 90], 2:[-7.498, 284.716]},
-    7: {1: [81.98,241.954, 5, 90], 2:[-7.498, 165.809]},
-    8: {1: [170.551,240.054, 5, 0], 2:[106.411, 191.63]}
+    5: {1: [80, 306.6, 5, 180], 2:[81.98, 241.954]}, # extra
+    6: {1: [106.411, 191.63, 5, 0], 2:[-7.498, 284.716]}, # extra
+    7: {1: [-7.498, 200.0, 5, 270], 2:[35.25,206]},
+    8: {1: [35.25, 206, 5, 90], 2:[81.98,241.954]},
+    9: {1: [50,241.954, 5, 0], 2:[80, 306.6]},
+    10: {1:[193.75,269.2610168457031, 5, 270], 2:[135.25,206]}
 }
 
 IM_WIDTH = 640
@@ -40,7 +42,7 @@ class CarEnv:
     STEER_AMT = 1.0   # actions that the agent can take [-1, 0, 1] --> [turn left, go straight, turn right]
     front_camera = None
 
-    def __init__(self, save_root):
+    def __init__(self, save_root, tick):
         # to initialize
         self.client = carla.Client("localhost", 2000)
         self.client.set_timeout(20.0)
@@ -54,7 +56,7 @@ class CarEnv:
         self.reached = 0
         self.actor_list = []
         self.save_root = save_root
-        self.tick=0
+        self.tick=tick
 
     def image_dep(self, image):
         self.cam = image
@@ -286,24 +288,35 @@ class CarEnv:
 
 
 if __name__ == '__main__':
-    save_root = Path('/home/ubuntu/mgibert/Development/safe-nav-RL/cnn_test2/test2_dataset')
+    save_root = Path('/home/ubuntu/mgibert/Development/safe-nav-RL/cnn_test2/test2_dataset/test_traffic')
     save_root.mkdir(exist_ok=True, parents=True)
-    max_dataset_items = 100
-    env = CarEnv(save_root=save_root)
-
+    previous_ticks = [path.stem for path in save_root.iterdir()]
+    if previous_ticks:
+        tick = int(sorted([path.stem for path in save_root.iterdir()])[-1].split("_")[0])
+    else:
+        tick=0
+    max_dataset_items = 10000
+    env = CarEnv(save_root=save_root, tick=tick)
     while env.tick < max_dataset_items:
+        failed=False
         try:
             env.set_spawn_point_and_trajectory()
             print(env.traj)
             env.iniciate_agent_with_sensors()
             print('Start')
             env.start_driving()
-            while len(env.collision_history) == 0 and env.tick < max_dataset_items:
-                env.capture_data()
-                env.world.tick()
-                env.tick += 1
-                print('Collected')
-                time.sleep(3)
+            while len(env.collision_history) == 0 and env.tick < max_dataset_items and not failed:
+                try:
+                    if env.vehicle.is_at_traffic_light():
+                        if env.vehicle.get_traffic_light().get_state() == carla.TrafficLightState.Red:
+                            env.vehicle.set_target_velocity(carla.Vector3D(2.5,0,0))
+                    env.capture_data()
+                    env.world.tick()
+                    env.tick += 1
+                    print('Collected')
+                    time.sleep(1)
+                except Exception:
+                    failed=True
             for actor in env.actor_list:
                 actor.destroy()
             env.actor_list = []

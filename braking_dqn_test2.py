@@ -38,7 +38,6 @@ import weakref
 import time
 import numpy as np
 import cv2
-
 from collections import deque
 from keras.applications.xception import Xception 
 from keras.optimizers import Adam
@@ -47,7 +46,7 @@ from keras.callbacks import TensorBoard
 
 from keras.models import Sequential, Model, load_model
 from keras.layers import AveragePooling2D, Conv2D, Activation, Flatten, GlobalAveragePooling2D, Dense, Concatenate, Input
-from keras.applications.resnet50 import preprocess_input, ResNet50
+
 
 #from tensorboard import *
 
@@ -55,6 +54,10 @@ import tensorflow as tf
 import keras.backend.tensorflow_backend as backend
 from threading import Thread
 from tensorflow.keras import regularizers
+
+import torch
+import torchvision.transforms as T
+from cnn_test2.train_cnn_pytorch import MyModel
 
 from tqdm import tqdm
 
@@ -64,7 +67,7 @@ IM_HEIGHT = 480
 SECONDS_PER_EPISODE = 20
 REPLAY_MEMORY_SIZE = 5_000
 MIN_REPLAY_MEMORY_SIZE = 1_000
-MINIBATCH_SIZE = 16 # 16
+MINIBATCH_SIZE = 16
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
 UPDATE_TARGET_EVERY = 2
@@ -138,6 +141,8 @@ class ModifiedTensorBoard(TensorBoard):
                 if self.model is not None:
                     self.writer.add_graph(sess.graph, global_step=index)
             self.writer.flush()  
+                
+
 
 '''
 Defining the Carla Environment Class. 
@@ -151,7 +156,7 @@ class CarEnv:
     front_camera = None
 
 
-    def __init__(self):
+    def __init__(self, cnn_checkpoint):
         # to initialize
         self.client = carla.Client("localhost", 2000)
         self.client.set_timeout(20.0)
@@ -170,24 +175,43 @@ class CarEnv:
         self.cam = None
         self.seg = None
 
-        # Load the CNN
-        resnet = ResNet50(weights='imagenet')
-        self.cnn_encoder = Model(inputs=resnet.input, outputs=resnet.get_layer('avg_pool').output)
+        self.cnn_encoder = MyModel.load_from_checkpoint(cnn_checkpoint)
+        self.cnn_encoder.eval()
+        self.tfms = T.Compose([
+            T.Resize((60, 80)),
+            T.ToTensor(),
+        ])
+        self.data_stats = {
+            'max': 10000.0, 
+            'min': 30.90290932617188
+        }
         
+    def obtain_state_from_images(self, depth_map, seg_img):
+        # Convert NumPy arrays to PIL Images
+        depth_pil = Image.fromarray(depth_map)
+        seg_img = seg_img.astype('uint8')  # Convert to uint8
+        seg_pil = Image.fromarray(seg_img)
 
-    def get_features_from_camera_sensor(self):
-        # Convert depth image to array of depth values
-        rgb_array = np.frombuffer(self.rgb.raw_data, dtype=np.dtype("uint8"))
-        rgb_array = np.reshape(rgb_array, (self.rgb.height, self.rgb.width, 4))
-        rgb_array = rgb_array[:,:,:-1].astype(np.float32)
-        # Preprocess RGB image
-        rgb_array = cv2.resize(rgb_array, DQNAgent.CNN_INPUT_SIZE)
-        rgb_array = np.expand_dims(rgb_array, axis=0) # /  255.0
-        x = preprocess_input(rgb_array)
-        # Get features from the CNN
-        cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)
-        return cnn_output
+        # Convert to RGB
+        depth_rgb = depth_pil.convert("RGB")
+        seg_rgb = seg_pil.convert("RGB")
 
+        # Apply transformations
+        depth_tensor = self.tfms(depth_rgb)  # Shape: (3, 60, 80)
+        seg_tensor = self.tfms(seg_rgb)      # Shape: (3, 60, 80)
+        
+        # Concatenate depth and segmentation tensors along the channel dimension
+        state_tensor = torch.cat([depth_tensor, seg_tensor], dim=0)
+        with torch.no_grad():
+            state = self.cnn_encoder.forward(state_tensor.unsqueeze(0))[0]
+        _, dobs, _ = state
+        dobs_np = dobs.detach().cpu().numpy() if isinstance(dobs, torch.Tensor) else np.array(dobs)
+        # Extract min and max from data_stats
+        dobs_min = self.data_stats['min']
+        dobs_max = self.data_stats['max']
+        # Reverse the transformation
+        original_dobs = ((dobs_np + 1) / 2) * (dobs_max - dobs_min) + dobs_min
+        return original_dobs
 
     def reset(self):
         # store any collision detected
@@ -208,7 +232,7 @@ class CarEnv:
         
         print("Spawning my agent.....")
 
-        # to use the depth camera
+        # to use the RGB camera
         self.depth_camera = self.blueprint_library.find("sensor.camera.depth")
         #self.depth_camera.set_attribute('image_type', 'Depth')
         self.depth_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
@@ -244,20 +268,6 @@ class CarEnv:
         self.seg_camera_sensor.listen(lambda data: self.image_seg(data))
         #print("In RESET FUNCTION after processing SEGMENTATION IMAGE")
         #print()
-
-        '''
-        To spawn the RGB Camera
-        '''
-        self.rgb_camera = self.blueprint_library.find("sensor.camera.rgb")
-        self.rgb_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
-        self.rgb_camera.set_attribute("image_size_y", f"{IM_HEIGHT}")
-        self.rgb_camera.set_attribute("fov", "40")
-        self.rgb_camera_spawn_point = carla.Transform(carla.Location(x=2, y=0, z=1.4), Rotation(yaw=0))
-        # to spawn the camera
-        self.rgb_camera_sensor = self.world.spawn_actor(self.rgb_camera, self.rgb_camera_spawn_point, attach_to = self.vehicle)
-        #print("Segmentation camera image sent for processing....")
-        self.actor_list.append(self.rgb_camera_sensor)
-        self.rgb_camera_sensor.listen(lambda data: self.image_rgb(data))
         
 
         # to initialize the car quickly and get it going
@@ -292,14 +302,14 @@ class CarEnv:
         while self.cam is None or self.seg is None:
             time.sleep(0.01)
             
-        self.process_images()
-        features = self.get_features_from_camera_sensor()
+        dis, depth_map, seg_img = self.process_images()
+        dobs = self.obtain_state_from_images(depth_map, seg_img)
 
         self.episode_start = time.time()
 
         self.vehicle.apply_control(carla.VehicleControl(throttle = 1.0, brake = 0.0))
 
-        return [(self.distance-300)/300, -1, features]
+        return [(dobs-300)/300, -1]
 
     
     # to record the collision data
@@ -312,10 +322,6 @@ class CarEnv:
         self.lanecrossing_history.append(event)
         print("Lane crossing history: ", event)
         
-
-    def image_rgb(self, image):
-        self.rgb = image
-
 
     def image_dep(self, image):
         self.cam = image
@@ -333,7 +339,7 @@ class CarEnv:
         depth_array1 = depth_array1.astype(np.int32)
         
         # Using this formula to get the distances
-        depth_map = (depth_array1[:, :, 0]*256*256 + depth_array1[:, :, 1]*256 + depth_array1[:, :, 2])/1000
+        depth_map = (depth_array1[:, :, 0]*255*255 + depth_array1[:, :, 1]*255 + depth_array1[:, :, 2])/1000
         
         # Making the sky at 0 distance
         x = np.where(depth_map >= 16646.655)
@@ -384,7 +390,10 @@ class CarEnv:
             11: [102, 102, 156],  # Walls
             12: [220, 220, 0],    # TrafficSigns
         }
-        
+        seg_array = np.zeros_like(image_array)
+        for label, color in colors.items():
+            seg_array = np.where(image_array[:, :, 2, None] == label, color, seg_array)
+
         for key in colors:
             #print("Key: ", key)
             #print(np.where((self.seg_array == [0, 0, key]).all(axis = 2)))
@@ -401,7 +410,7 @@ class CarEnv:
             dis = 10000
         self.distance = dis
         #print(dis)
-        return dis
+        return dis, depth_map, seg_array
 
         
 
@@ -438,8 +447,8 @@ class CarEnv:
         
         dist_from_goal = np.sqrt((pos.x - self.final_destination[0])**2 + (pos.y-self.final_destination[1])**2)
 
-        self.process_images()
-        features = self.get_features_from_camera_sensor()
+        dis, depth_map, seg_image = self.process_images()
+        dobs = self.obtain_state_from_images(depth_map, seg_image)
         
         done = False
 
@@ -487,7 +496,7 @@ class CarEnv:
 
         print(reward)
 
-        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300, features], reward, done, waypoint
+        return [(dobs-300)/300, (kmh-30)/30-(dobs-300)/300], reward, done, waypoint
     
             
     def trajectory(self, draw = False):
@@ -529,14 +538,9 @@ class CarEnv:
 To define the Deep Q Network Agent
 '''
 class DQNAgent:
-
-    FEATURES = 2048
-    CNN_INPUT_SIZE = (224,224)
-
     def __init__(self):
         #self.model = load_model(MODEL_PATH)
         #self.target_model = load_model(MODEL_PATH)
-        # Load Model
         self.model = self.create_model()
         self.target_model = self.create_model()
         self.target_model.set_weights(self.model.get_weights())
@@ -557,9 +561,9 @@ class DQNAgent:
 
     def create_model(self):
         # define the model
-        dqn_model = Sequential()
-        dqn_model.add(Dense(2, input_shape=(DQNAgent.FEATURES+1,), activation='linear', name='dense1'))
-        combined_model = Model(inputs=dqn_model.input, outputs=dqn_model.output)
+        model3 = Sequential()
+        model3.add(Dense(2, input_shape=(2,), activation='linear', name='dense1'))
+        combined_model = Model(inputs=model3.input, outputs=model3.output)
         
         # compile the model
         combined_model.compile(loss='mse', optimizer=Adam(lr=0.0001), metrics=['accuracy'])
@@ -580,20 +584,12 @@ class DQNAgent:
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
         # to normalize the image
-        current_data = []
-        for transition in minibatch:
-            _, velocity, features = transition[0]
-            current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
-        current_data = np.array(current_data)
+        current_data = np.array([[transition[0][i] for i in range(2)] for transition in minibatch])
         # predicting all the datapoints present in the mini-batch
         with self.graph.as_default():
             current_qs_list = self.model.predict(current_data, PREDICTION_BATCH_SIZE)
 
-        new_current_data = []
-        for transition in minibatch:
-            _, velocity, features = transition[3]
-            new_current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
-        new_current_data = np.array(new_current_data)
+        new_current_data = np.array([[transition[3][i] for i in range(2)] for transition in minibatch])
         with self.graph.as_default():
             future_qs_list = self.target_model.predict(new_current_data, PREDICTION_BATCH_SIZE)
 
@@ -611,8 +607,7 @@ class DQNAgent:
             current_qs = current_qs_list[index]
             current_qs[action] = new_q
 
-            _, velocity, features = current_state
-            X_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
+            X_data.append([current_state[i] for i in range(2)])
             y.append(current_qs)
 
         log_this_step = False
@@ -635,26 +630,21 @@ class DQNAgent:
 
     
     def get_qs(self, state):
-        _, velocity, features = state
-        dqn_input = np.concatenate((features, [[velocity]]), axis=1)
-        return self.model.predict(dqn_input)[0]
+        return self.model.predict(np.array(state).reshape(-1, *np.array(state).shape))[0]
 
     
     def train_in_loop(self):
-        X2 = np.random.uniform(size=(1, DQNAgent.FEATURES+1)).astype(np.float32)
+        X2 = np.random.uniform(size=(1, 2)).astype(np.float32)
         y = np.random.uniform(size=(1, 2)).astype(np.float32)
         with self.graph.as_default():
-            self.model.fit(X2, y, verbose=False, batch_size=1)
+            self.model.fit(X2,y, verbose=False, batch_size=1)
 
         self.training_initialized = True
 
         while True:
             if self.terminate:
                 return
-            try:
-                self.train()
-            except Exception as e:
-                print(f'Error Happened!!!!!: {e}')
+            self.train()
             time.sleep(0.01)
 
            
@@ -675,7 +665,8 @@ if __name__ == '__main__':
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
     backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
-    path = r"/home/ubuntu/mgibert/Development/models/test1"
+    path = r"/home/ubuntu/mgibert/Development/models/test2_braking"
+    checkpoint = f"/home/ubuntu/mgibert/Development/models/test_cnn/best_model-v1.ckpt"
     
     fps_counter = deque(maxlen=60)
     
@@ -685,7 +676,8 @@ if __name__ == '__main__':
 
     # Create agent and environment
     agent = DQNAgent()
-    env = CarEnv()
+    env = CarEnv(checkpoint)
+
 
     # Start training thread and wait for training to be initialized
     trainer_thread = Thread(target=agent.train_in_loop, daemon=True)
@@ -694,7 +686,7 @@ if __name__ == '__main__':
         time.sleep(0.01)
     # Initialize predictions - first prediction takes longer as of initialization that has to be done
     # It's better to do a first prediction then before we start iterating over episode steps
-    agent.get_qs([-1, -1, np.ones((1, DQNAgent.FEATURES))*-1])
+    agent.get_qs([-1, -1])
     
 
     # Connect to the Carla simulator
@@ -709,6 +701,7 @@ if __name__ == '__main__':
     # to wait for the agent to spawn and start moving
     time.sleep(5)
 
+
     '''
     Iterate over the episodes
     '''
@@ -716,7 +709,7 @@ if __name__ == '__main__':
         #try:
         #for direction in range(2):
             actor_list = []
-            front_car_pos = np.random.randint(100,140)
+            front_car_pos = np.random.randint(90,130)
             spawn_point = carla.Transform(Location(x=front_car_pos, y=306.886, z=5), Rotation(yaw=0))
             vehicle = world.spawn_actor(vehicle_bp, spawn_point)
             actor_list.append(vehicle)

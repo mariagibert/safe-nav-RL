@@ -38,7 +38,6 @@ import weakref
 import time
 import numpy as np
 import cv2
-
 from collections import deque
 from keras.applications.xception import Xception 
 from keras.optimizers import Adam
@@ -47,7 +46,7 @@ from keras.callbacks import TensorBoard
 
 from keras.models import Sequential, Model, load_model
 from keras.layers import AveragePooling2D, Conv2D, Activation, Flatten, GlobalAveragePooling2D, Dense, Concatenate, Input
-from keras.applications.resnet50 import preprocess_input, ResNet50
+
 
 #from tensorboard import *
 
@@ -56,7 +55,12 @@ import keras.backend.tensorflow_backend as backend
 from threading import Thread
 from tensorflow.keras import regularizers
 
+import torch
+import torchvision.transforms as T
+from cnn_test2.train_cnn_pytorch import MyModel
+
 from tqdm import tqdm
+
 
 SHOW_PREVIEW = False
 IM_WIDTH = 640
@@ -64,11 +68,11 @@ IM_HEIGHT = 480
 SECONDS_PER_EPISODE = 20
 REPLAY_MEMORY_SIZE = 5_000
 MIN_REPLAY_MEMORY_SIZE = 1_000
-MINIBATCH_SIZE = 16 # 16
+MINIBATCH_SIZE = 16
 PREDICTION_BATCH_SIZE = 1
 TRAINING_BATCH_SIZE = MINIBATCH_SIZE // 4
 UPDATE_TARGET_EVERY = 2
-MODEL_NAME = "Braking"
+MODEL_NAME = "Driving"
 
 MEMORY_FRACTION = 0.8
 MIN_REWARD = 0
@@ -76,17 +80,31 @@ MIN_REWARD = 0
 EPISODES = 40
 DISCOUNT = 0.99
 epsilon = 0.5
-EPSILON_DECAY = 0.95 #0.95 ## 0.9975 99975
+EPSILON_DECAY = 0.95
 MIN_EPSILON = 0.01
 
 AGGREGATE_STATS_EVERY = 1
 
 
-# to set the intial and final locations
-town2 = {1: [80, 306.6, 5, 0], 2:[194.01885986328125,262.87078857421875]}
+# path for training
+town2 = {1: [193.75,269.2610168457031, 5, 270], 2:[135.25,206]} #left turn
+
+# #Trajectory 1
+# town2 = {1: [80, 306.6, 5, 0], 2:[135.25,206]}}
+
+# #Trajectory 2
+# town2 = {1: [-7.498, 284.716, 5, 90], 2:[81.98,241.954]}
+
+# #Trajectory 3
+# town2 = {1: [-7.498, 165.809, 5, 90], 2:[81.98,241.954]}
+
+# #Trajectory 4
+# town2 = {1: [106.411, 191.63, 5, 0], 2:[170.551,240.054]}
+
+
 curves = [0, town2]
 
-#MODEL_PATH = 'models/Xception__-518.00max_-766.40avg_-1097.00min__1677834457.model'
+#MODEL_PATH = "models/Driving__3120.00max_3120.00avg_3120.00min__1679091203.model"
 
 
 
@@ -137,7 +155,9 @@ class ModifiedTensorBoard(TensorBoard):
                 self.writer.add_summary(summary, index)
                 if self.model is not None:
                     self.writer.add_graph(sess.graph, global_step=index)
-            self.writer.flush()  
+            self.writer.flush()
+                
+
 
 '''
 Defining the Carla Environment Class. 
@@ -151,45 +171,65 @@ class CarEnv:
     front_camera = None
 
 
-    def __init__(self):
+    def __init__(self, cnn_checkpoint):
         # to initialize
         self.client = carla.Client("localhost", 2000)
         self.client.set_timeout(20.0)
         self.world = self.client.get_world()
         self.blueprint_library = self.world.get_blueprint_library()
         self.model_3 = self.blueprint_library.find("vehicle.tesla.model3")
-        self.front_model3 = self.blueprint_library.find("vehicle.tesla.model3")
         self.via = 2
         self.crossing = 0
         self.curves = 1
         self.reached = 0
-        self.waypoint = self.client.get_world().get_map().get_waypoint(Location(x=curves[self.curves][1][0], y=curves[self.curves][1][1], z=curves[self.curves][1][2]), project_to_road=True)
-        self.final_destination  = [180, 306.6]
+        self.start = town2[1]
+        self.phi = []
+        self.dc = []
+        self.vel = []
+        self.time = []
+
+        self.cnn_encoder = MyModel.load_from_checkpoint(cnn_checkpoint)
+        self.cnn_encoder.eval()
+        self.tfms = T.Compose([
+            T.Resize((60, 80)),
+            T.ToTensor(),
+        ])
+        self.data_stats = {
+            'max': 161.5544201909273, 
+            'min': -97.78582734841427, 
+        }
+
+    def obtain_state_from_images(self, depth_map, seg_img):
+        # Convert NumPy arrays to PIL Images
+        depth_pil = Image.fromarray(depth_map)
+        seg_img = seg_img.astype('uint8')  # Convert to uint8
+        seg_pil = Image.fromarray(seg_img)
+
+        # Convert to RGB
+        depth_rgb = depth_pil.convert("RGB")
+        seg_rgb = seg_pil.convert("RGB")
+
+        # Apply transformations
+        depth_tensor = self.tfms(depth_rgb)  # Shape: (3, 60, 80)
+        seg_tensor = self.tfms(seg_rgb)      # Shape: (3, 60, 80)
         
-        self.distance = None
-        self.cam = None
-        self.seg = None
-
-        # Load the CNN
-        resnet = ResNet50(weights='imagenet')
-        self.cnn_encoder = Model(inputs=resnet.input, outputs=resnet.get_layer('avg_pool').output)
-        
-
-    def get_features_from_camera_sensor(self):
-        # Convert depth image to array of depth values
-        rgb_array = np.frombuffer(self.rgb.raw_data, dtype=np.dtype("uint8"))
-        rgb_array = np.reshape(rgb_array, (self.rgb.height, self.rgb.width, 4))
-        rgb_array = rgb_array[:,:,:-1].astype(np.float32)
-        # Preprocess RGB image
-        rgb_array = cv2.resize(rgb_array, DQNAgent.CNN_INPUT_SIZE)
-        rgb_array = np.expand_dims(rgb_array, axis=0) # /  255.0
-        x = preprocess_input(rgb_array)
-        # Get features from the CNN
-        cnn_output = self.cnn_encoder.predict(x).reshape(1,-1)
-        return cnn_output
-
+        # Concatenate depth and segmentation tensors along the channel dimension
+        state_tensor = torch.cat([depth_tensor, seg_tensor], dim=0)
+        with torch.no_grad():
+            state = self.cnn_encoder.forward(state_tensor.unsqueeze(0))[0]
+        phi, _, dc = state
+        phi_np = phi.detach().cpu().numpy() if isinstance(phi, torch.Tensor) else np.array(phi)
+        dc_np = dc.detach().cpu().numpy() if isinstance(dc, torch.Tensor) else np.array(dc)
+        # Extract min and max from data_stats
+        dc_min = self.data_stats['min']
+        dc_max = self.data_stats['max']
+        # Reverse the transformation
+        original_phi = phi_np * 180
+        original_dc = ((dc_np + 1) / 2) * (dc_max - dc_min) + dc_min
+        return original_phi, original_dc
 
     def reset(self):
+
         # store any collision detected
         self.collision_history = []
         # to store all the actors that are present in the environment
@@ -197,18 +237,17 @@ class CarEnv:
         # store the number of times the vehicles crosses the lane marking
         self.lanecrossing_history = []
         
+        
         '''
         To spawn the Vehicle (agent)
         '''
-        initial_pos = curves[self.curves][1]
+        initial_pos = self.start
         self.transform = Transform(Location(x=initial_pos[0], y=initial_pos[1], z=initial_pos[2]), Rotation(yaw=initial_pos[3]))
         # to spawn the actor; the veichle
         self.vehicle = self.world.spawn_actor(self.model_3, self.transform)
         self.actor_list.append(self.vehicle)
-        
-        print("Spawning my agent.....")
 
-        # to use the depth camera
+        '''SPAWN DEPTH CAMERA'''
         self.depth_camera = self.blueprint_library.find("sensor.camera.depth")
         #self.depth_camera.set_attribute('image_type', 'Depth')
         self.depth_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
@@ -223,8 +262,7 @@ class CarEnv:
 
         # to record the data from the camera sensor
         self.camera_sensor.listen(lambda data: self.image_dep(data))
-        #self.camera_sensor.listen(lambda image: self.process_image(image.convert(ColorConverter.LogarithmicDepth)))
-        
+
         '''
         To spawn the SEGMENTATION camera
         '''
@@ -245,21 +283,6 @@ class CarEnv:
         #print("In RESET FUNCTION after processing SEGMENTATION IMAGE")
         #print()
 
-        '''
-        To spawn the RGB Camera
-        '''
-        self.rgb_camera = self.blueprint_library.find("sensor.camera.rgb")
-        self.rgb_camera.set_attribute("image_size_x", f"{IM_WIDTH}")
-        self.rgb_camera.set_attribute("image_size_y", f"{IM_HEIGHT}")
-        self.rgb_camera.set_attribute("fov", "40")
-        self.rgb_camera_spawn_point = carla.Transform(carla.Location(x=2, y=0, z=1.4), Rotation(yaw=0))
-        # to spawn the camera
-        self.rgb_camera_sensor = self.world.spawn_actor(self.rgb_camera, self.rgb_camera_spawn_point, attach_to = self.vehicle)
-        #print("Segmentation camera image sent for processing....")
-        self.actor_list.append(self.rgb_camera_sensor)
-        self.rgb_camera_sensor.listen(lambda data: self.image_rgb(data))
-        
-
         # to initialize the car quickly and get it going
         self.vehicle.apply_control(carla.VehicleControl(throttle = 0.0, brake = 0.0))
         time.sleep(4)
@@ -267,6 +290,7 @@ class CarEnv:
         '''
         To spawn the collision sensor
         '''
+        # to introduce the collision sensor to detect what type of collision is happening
         col_sensor = self.blueprint_library.find("sensor.other.collision")
         
         # keeping the location of the sensor to be same as that of the RGB camera
@@ -275,10 +299,8 @@ class CarEnv:
 
         # to record the data from the collision sensor
         self.collision_sensor.listen(lambda event: self.collision_data(event))
-        
-        '''
-        TO spawn the lane crossing sensor
-        '''
+
+        # to introduce the lanecrossing sensor to identify vehicles trajectory
         lane_crossing_sensor = self.blueprint_library.find("sensor.other.lane_invasion")
 
         # keeping the location of the sensor to be same as that of RGM Camera
@@ -287,43 +309,31 @@ class CarEnv:
 
         # to record the data from the lanecrossing_sensor
         self.lanecrossing_sensor.listen(lambda event: self.lanecrossing_data(event))
+        
+        traj = self.trajectory()
+        self.path = []
+        for el in traj:
+            self.path.append(el[0])
 
-
-        while self.cam is None or self.seg is None:
-            time.sleep(0.01)
-            
-        self.process_images()
-        features = self.get_features_from_camera_sensor()
-
+        # going to keep an episode length of 10 seconds otherwise the car learns to go around a circle and keeps doing the same thing
         self.episode_start = time.time()
 
         self.vehicle.apply_control(carla.VehicleControl(throttle = 1.0, brake = 0.0))
-
-        return [(self.distance-300)/300, -1, features]
-
-    
-    # to record the collision data
-    def collision_data(self, event):
-        self.collision_history.append(event)
-
-    
-    # to record the lane crossing data
-    def lanecrossing_data(self, event):
-        self.lanecrossing_history.append(event)
-        print("Lane crossing history: ", event)
         
-
-    def image_rgb(self, image):
-        self.rgb = image
-
-
+        return [0,0] #return [self.front_camera, 0,0, initial_pos[0], initial_pos[1]]
+    
     def image_dep(self, image):
         self.cam = image
-        
 
     def image_seg(self, image):
         self.seg = image
 
+    def collision_data(self, event):
+        self.collision_history.append(event)
+    
+    def lanecrossing_data(self, event):
+        self.lanecrossing_history.append(event)
+        print("Lane crossing history: ", event)
 
     # to process the image
     def process_images(self):        
@@ -333,41 +343,17 @@ class CarEnv:
         depth_array1 = depth_array1.astype(np.int32)
         
         # Using this formula to get the distances
-        depth_map = (depth_array1[:, :, 0]*256*256 + depth_array1[:, :, 1]*256 + depth_array1[:, :, 2])/1000
+        depth_map = (depth_array1[:, :, 0]*255*255 + depth_array1[:, :, 1]*255 + depth_array1[:, :, 2])/1000
         
         # Making the sky at 0 distance
         x = np.where(depth_map >= 16646.655)
         depth_map[x] = 0
-
-        # Showing the initial depth image
-        #cv2.imshow("Initial: ", np.array(depth_array1, dtype = np.uint8))
-
-        # Calculate distance from camera to each point in world coordinates
-        distances = depth_map
-        
-        # Print the distance to the car
-        #print(distances[int(cy),int(cx)])
-
-
-        # uncomment the code below to get a distance map
-        # # Plot the distance map
-        #fig, ax = plt.subplots()
-        #cmap = plt.cm.jet
-        #cmap.set_bad(color='black')
-        #im = ax.imshow(depth_array, cmap=cmap, vmin=0, vmax=50)#int(distances[int(cy),int(cx)]*2))
-        #ax.set_title('Distance Map')
-        #ax.set_xlabel('Pixel X')
-        #ax.set_ylabel('Pixel Y')
-        #cbar = ax.figure.colorbar(im, ax=ax)
-        #cbar.ax.set_ylabel('Distance (m)', rotation=-90, va="bottom")
-        #plt.savefig("pics/"+str(int(time.time()*100))+".jpg")
         
         image_array = np.frombuffer(self.seg.raw_data, dtype=np.dtype("uint8"))
         image_array = np.reshape(image_array, (self.seg.height, self.seg.width, 4))
         
         # removing the alpha channel
         image_array = image_array[:, :, :3]
-        self.seg_array = image_array 
         
         colors = {
             0: [0, 0, 0],         # None
@@ -384,42 +370,34 @@ class CarEnv:
             11: [102, 102, 156],  # Walls
             12: [220, 220, 0],    # TrafficSigns
         }
-        
-        for key in colors:
-            #print("Key: ", key)
-            #print(np.where((self.seg_array == [0, 0, key]).all(axis = 2)))
-            #copy_seg_img = np.copy(self.seg_array)
-            #seg_image_copy[np.where((seg_image_copy == [0, 0, key]).all(axis = 2))] = colors[key]
+        seg_array = np.zeros_like(image_array)
+        for label, color in colors.items():
+            seg_array = np.where(image_array[:, :, 2, None] == label, color, seg_array)
 
-            # to store the vehicle indices only
-            if key == 10:
-                self.vehicle_indices = np.where((self.seg_array == [0, 0, key]).all(axis = 2))
+        return depth_map, seg_array
 
-        if len(self.vehicle_indices[0]) != 0:
-            dis = np.sum(distances[self.vehicle_indices])/len(self.vehicle_indices[0])
-        else:
-            dis = 10000
-        self.distance = dis
-        #print(dis)
-        return dis
-
-        
 
     def step(self, action, current_state):
         '''
-        To take 2 actions; braking or throttle
+        Take 5 actions; go straight, turn left, turn right, turn slightly left, turn slightly right
         '''
-        if action == 0:
-            self.vehicle.apply_control(carla.VehicleControl(throttle=0, brake = 1.0))
 
-        if action == 1:
+        if action == 0:
             self.vehicle.apply_control(carla.VehicleControl(throttle=0.3, steer=0*self.STEER_AMT))
 
+        if action == 1:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.1, steer=-0.6*self.STEER_AMT))
 
-        if action != 0:
-            action = 1
+        if action == 2:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.1, steer=0.6*self.STEER_AMT))
 
+        if action == 3:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.4, steer=-0.1*self.STEER_AMT))
 
+        if action == 4:
+            self.vehicle.apply_control(carla.VehicleControl(throttle=0.4, steer=0.1*self.STEER_AMT))
+
+        
         # initialize a reward for a single action 
         reward = 0
         # to calculate the kmh of the vehicle
@@ -431,76 +409,154 @@ class CarEnv:
         rot = self.vehicle.get_transform().rotation
         
         # to get the closest waypoint to the car
-        #waypoint = self.client.get_world().get_map().get_waypoint(pos, project_to_road=True)
-        waypoint = self.trajectory()[0][0]
+        waypoint = self.client.get_world().get_map().get_waypoint(pos, project_to_road=True)
+        #path = self.trajectory()
+        #waypoint = path[0][0]
+        waypoint_ind = self.get_closest_waypoint(self.path, waypoint) + 1
+        print(waypoint_ind)
+        waypoint = self.path[waypoint_ind]
+        if len(self.path) != 1:
+            next_waypoint = self.path[waypoint_ind+1]
+        else:
+            next_waypoint = waypoint
         waypoint_loc = waypoint.transform.location
         waypoint_rot = waypoint.transform.rotation
+        next_waypoint_loc = next_waypoint.transform.location
+        next_waypoint_rot = next_waypoint.transform.rotation
         
-        dist_from_goal = np.sqrt((pos.x - self.final_destination[0])**2 + (pos.y-self.final_destination[1])**2)
+        final = [curves[self.curves][2][0], curves[self.curves][2][1]]
+        final_destination = [curves[self.curves][self.via][0], curves[self.curves][self.via][1]]
+        dist_from_goal = np.sqrt((pos.x - final_destination[0])**2 + (pos.y-final_destination[1])**2)
 
-        self.process_images()
-        features = self.get_features_from_camera_sensor()
-        
+        depth_map, seg_image = self.process_images()
+        phi, dc = self.obtain_state_from_images(depth_map, seg_image)
+
         done = False
+        
+        print(current_state[0]) 
+        print(current_state[1]) 
+        
 
-        '''
-        TO DEFINE THE REWARDS
-        '''
-        print(current_state[1]*30+30)
-        print(current_state[0]*300+300)
-        
-        
-        if (current_state[0]*300+300)< (((current_state[1]+current_state[0])*30+30)*10 + 10):
+        # Defining the Reward function by comparing the action taken to a suboptimal policy
+        if abs(current_state[0])<5:
             if action == 0:
-                reward += 3
-            else:
-                reward -= 3
-        else:
-            if action == 1:
                 reward += 2
             else:
-                reward -= 2
-       
-        if current_state[0]*300+300 > 100 and (current_state[1]+current_state[0])*30+30 < 1:
+                reward -= 1
+        elif abs(current_state[0])<10:
+            if current_state[0]<0:
+                if action == 3:
+                    reward += 2
+                elif action == 1:
+                    reward += 1
+                else:
+                    reward -= 1
+            else:
+                if action == 4:
+                    reward += 2
+                elif action == 2:
+                    reward += 1
+                else:
+                    reward -= 1
+        else:
+            if current_state[0]<0:
+                if action == 1:
+                    reward += 2
+                elif action == 3:
+                    reward += 1
+                else:
+                    reward -= 1
+            else:
+                if action == 2:
+                    reward += 2
+                elif action == 4:
+                    reward += 1
+                else:
+                    reward -= 1
+                    
+        if abs(current_state[1])<0.1:
             if action == 0:
-                reward -= 10
-
+                reward += 4
+            else:
+                reward -= 2
+        elif abs(current_state[1])<0.5:
+            if current_state[1]<0:
+                if action == 3:
+                    reward += 2
+                elif action == 1:
+                    reward += 1
+                else:
+                    reward -= 1
+            else:
+                if action == 4:
+                    reward += 2
+                elif action == 2:
+                    reward += 1
+                else:
+                    reward -= 1
+        else:
+            if current_state[1]<0:
+                if action == 1:
+                    reward += 2
+                elif action == 3:
+                    reward += 1
+                else:
+                    reward -= 1
+            else:
+                if action == 2:
+                    reward += 2
+                elif action == 4:
+                    reward += 1
+                else:
+                    reward -= 1
+                    
         
-        if self.distance<150 and kmh == 0:
-            done = True
-            reward = 200
-            
+        if abs(dc)>2:
+            reward -= 10
+        
         # to avoid collisions
         if len(self.collision_history) != 0:
             done = True
             reward = - 200
 
-        
-        # to end the episode if the car reaches the final destination
-        if dist_from_goal < 1:
+        # to end the episode if phi value goes high
+        if abs(phi)>100:
+            done = True
+            reward = -200
+            
+        # Ending the episode if the distance to the centerline of the road is greater than 3
+        if abs(dc)>3:
+            done = True
+            reward = -200
+            
+        # to end the episode if the car reaches close to the final destination
+        if dist_from_goal < 5:
             self.reached = 1
             done = True
 
         # to run each episode for just 30 secodns
-        if self.episode_start + 100 < time.time():
+        if self.episode_start + 200 < time.time():
             done = True
 
         print(reward)
+        
+        self.phi.append(phi)
+        self.dc.append(dc)
+        self.vel.append(kmh)
+        self.time.append(time.time())
 
-        return [(self.distance-300)/300, (kmh-30)/30-(self.distance-300)/300, features], reward, done, waypoint
-    
-            
+        return [phi, dc*15], reward, done, waypoint
+
+
     def trajectory(self, draw = False):
-        '''
-        To get the trajectory
-        '''
         amap = self.world.get_map()
-        sampling_resolution = 2
+        sampling_resolution = 0.5
         # dao = GlobalRoutePlannerDAO(amap, sampling_resolution)
         grp = GlobalRoutePlanner(amap, sampling_resolution)
         # grp.setup()
         
-        start_location = self.vehicle.get_transform().location
+        #start_location = self.vehicle.get_transform().location
+        start_location = carla.Location(x=self.start[0], y=self.start[1], z=0)
         end_location = carla.Location(x=town2[2][0], y=town2[2][1], z=0)
         a = amap.get_waypoint(start_location, project_to_road=True)
         b = amap.get_waypoint(end_location, project_to_road=True)
@@ -522,21 +578,28 @@ class CarEnv:
                     persistent_lines=True)
                 i += 1
         return w1
+    
+
+    def get_closest_waypoint(self, waypoint_list, target_waypoint):
+        closest_waypoint = None
+        closest_distance = float('inf')
+        for i, waypoint in enumerate(waypoint_list):
+            distance = math.sqrt((waypoint.transform.location.x - target_waypoint.transform.location.x)**2 +
+                                 (waypoint.transform.location.y - target_waypoint.transform.location.y)**2)
+            if distance < closest_distance:
+                closest_waypoint = i
+                closest_distance = distance
+        return closest_waypoint
 
 
 
 '''
-To define the Deep Q Network Agent
+TO define the Deep Q Network agent class
 '''
 class DQNAgent:
-
-    FEATURES = 2048
-    CNN_INPUT_SIZE = (224,224)
-
     def __init__(self):
         #self.model = load_model(MODEL_PATH)
         #self.target_model = load_model(MODEL_PATH)
-        # Load Model
         self.model = self.create_model()
         self.target_model = self.create_model()
         self.target_model.set_weights(self.model.get_weights())
@@ -554,12 +617,11 @@ class DQNAgent:
         self.last_logged_episode = 0
         self.training_initialized = False
 
-
     def create_model(self):
-        # define the model
-        dqn_model = Sequential()
-        dqn_model.add(Dense(2, input_shape=(DQNAgent.FEATURES+1,), activation='linear', name='dense1'))
-        combined_model = Model(inputs=dqn_model.input, outputs=dqn_model.output)
+        model3 = Sequential()
+        model3.add(Dense(8, input_shape=(2,), activation='relu', name='dense1'))
+        model3.add(Dense(5, activation='linear', name='output'))
+        combined_model = Model(inputs=model3.input, outputs=model3.output)
         
         # compile the model
         combined_model.compile(loss='mse', optimizer=Adam(lr=0.0001), metrics=['accuracy'])
@@ -580,20 +642,12 @@ class DQNAgent:
         minibatch = random.sample(self.replay_memory, MINIBATCH_SIZE)
 
         # to normalize the image
-        current_data = []
-        for transition in minibatch:
-            _, velocity, features = transition[0]
-            current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
-        current_data = np.array(current_data)
+        current_data = np.array([[transition[0][i] for i in range(2)] for transition in minibatch])
         # predicting all the datapoints present in the mini-batch
         with self.graph.as_default():
             current_qs_list = self.model.predict(current_data, PREDICTION_BATCH_SIZE)
 
-        new_current_data = []
-        for transition in minibatch:
-            _, velocity, features = transition[3]
-            new_current_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
-        new_current_data = np.array(new_current_data)
+        new_current_data = np.array([[transition[3][i] for i in range(2)] for transition in minibatch])
         with self.graph.as_default():
             future_qs_list = self.target_model.predict(new_current_data, PREDICTION_BATCH_SIZE)
 
@@ -611,8 +665,7 @@ class DQNAgent:
             current_qs = current_qs_list[index]
             current_qs[action] = new_q
 
-            _, velocity, features = current_state
-            X_data.append(np.concatenate((features, [[velocity]]), axis=1)[0])
+            X_data.append([current_state[i] for i in range(2)])
             y.append(current_qs)
 
         log_this_step = False
@@ -635,34 +688,27 @@ class DQNAgent:
 
     
     def get_qs(self, state):
-        _, velocity, features = state
-        dqn_input = np.concatenate((features, [[velocity]]), axis=1)
-        return self.model.predict(dqn_input)[0]
+        return self.model.predict(np.array(state).reshape(-1, *np.array(state).shape))[0]
 
-    
     def train_in_loop(self):
-        X2 = np.random.uniform(size=(1, DQNAgent.FEATURES+1)).astype(np.float32)
-        y = np.random.uniform(size=(1, 2)).astype(np.float32)
+        X2 = np.random.uniform(size=(1, 2)).astype(np.float32)
+        y = np.random.uniform(size=(1, 5)).astype(np.float32)
         with self.graph.as_default():
-            self.model.fit(X2, y, verbose=False, batch_size=1)
+            self.model.fit(X2,y, verbose=False, batch_size=1)
 
         self.training_initialized = True
 
         while True:
             if self.terminate:
                 return
-            try:
-                self.train()
-            except Exception as e:
-                print(f'Error Happened!!!!!: {e}')
+            self.train()
             time.sleep(0.01)
 
            
      
 if __name__ == '__main__':
 
-    FPS = 60
-
+    FPS = 400
     # For stats
     ep_rewards = [-200]
 
@@ -671,13 +717,12 @@ if __name__ == '__main__':
     np.random.seed(1)
     tf.set_random_seed(1)
 
-    # Memory fraction, used mostly when training multiple agents
+    # Memory fraction, used mostly when trai8ning multiple agents
     gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=MEMORY_FRACTION)
     backend.set_session(tf.Session(config=tf.ConfigProto(gpu_options=gpu_options)))
 
-    path = r"/home/ubuntu/mgibert/Development/models/test1"
-    
-    fps_counter = deque(maxlen=60)
+    path = r"/home/ubuntu/mgibert/Development/models/test2_driving/"
+    checkpoint = f"/home/ubuntu/mgibert/Development/models/test_cnn/best_model-v1.ckpt"
     
     # Create models folder
     if not os.path.isdir(path):
@@ -685,7 +730,8 @@ if __name__ == '__main__':
 
     # Create agent and environment
     agent = DQNAgent()
-    env = CarEnv()
+    env = CarEnv(checkpoint)
+
 
     # Start training thread and wait for training to be initialized
     trainer_thread = Thread(target=agent.train_in_loop, daemon=True)
@@ -694,38 +740,21 @@ if __name__ == '__main__':
         time.sleep(0.01)
     # Initialize predictions - first prediction takes longer as of initialization that has to be done
     # It's better to do a first prediction then before we start iterating over episode steps
-    agent.get_qs([-1, -1, np.ones((1, DQNAgent.FEATURES))*-1])
-    
+    agent.get_qs([0,0])
 
-    # Connect to the Carla simulator
-    client = carla.Client('localhost', 2000)
-    client.set_timeout(20.0)
-    world = client.get_world()
-
-    # Spawn a vehicle in the world
-    blueprint_library = world.get_blueprint_library()
-    vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
-
-    # to wait for the agent to spawn and start moving
-    time.sleep(5)
-
-    '''
-    Iterate over the episodes
-    '''
+    # Iterate over episodes
     for episode in tqdm(range(1, EPISODES + 1), ascii=True, unit='episodes'):
         #try:
         #for direction in range(2):
-            actor_list = []
-            front_car_pos = np.random.randint(100,140)
-            spawn_point = carla.Transform(Location(x=front_car_pos, y=306.886, z=5), Rotation(yaw=0))
-            vehicle = world.spawn_actor(vehicle_bp, spawn_point)
-            actor_list.append(vehicle)
             #print("direction: ", direction)
-            env.waypoint = env.client.get_world().get_map().get_waypoint(Location(x=curves[env.curves][1][0], y=curves[env.curves][1][1], z=curves[env.curves][1][2]), project_to_road=True)
-            
+            if episode%2 == 0:
+                town2 = {1: [182.65191650390625,236.9, 5, 180], 2:[135.25,206]}
+                env.start = town2[1]
+            else:
+                town2 = {1: [193.75,269.2610168457031, 5, 270], 2:[135.25,206]}
+                env.start = town2[1]
             env.reached = 0
             env.collision_hist = []
-            env.via = 2
             # Update tensorboard step every episode
             agent.tensorboard.step = episode
     
@@ -740,65 +769,45 @@ if __name__ == '__main__':
             # Reset flag and start iterating until episode ends
             done = False
             episode_start = time.time()
-            up_memory = []
-            #time.sleep(4)
+
     
             # Play for given number of seconds only
             while True:
+    
                 # This part stays mostly the same, the change is to query a model for Q values
                 if np.random.random() > epsilon:
                     # Get action from Q table
                     qs = agent.get_qs(current_state)
-                    print(qs, np.argmax(qs))
+                    print(qs)
                     action = np.argmax(qs)
                     #time.sleep(1/FPS)
                 else:
                     # Get random action
-                    action = np.random.randint(0, 2)
-                    if (current_state[0]*300+300)< (((current_state[1]+current_state[0])*30+30)*10 + 10):
-                        action = 0
-                    else:
-                        action = 1
+                    action = np.random.randint(0, 5)
                         
                     # This takes no time, so we add a delay matching 60 FPS (prediction above takes longer)
                     time.sleep(1/FPS)
                 new_state, reward, done, waypoint = env.step(action, current_state)
                 
-
-                    # This takes no time, so we add a delay matching 60 FPS (prediction above takes longer)
-                    #time.sleep(1/FPS)
-
-                
+  
                 # Transform new continous state to new discrete state and count reward
                 episode_reward += reward
     
                 # Every step we update replay memory
-                #up_memory.append((current_state, action, reward, new_state, done))
-                #if reward > -400:
                 agent.update_replay_memory((current_state, action, reward, new_state, done))
 
                 current_state = new_state
                 step += 1
-                env.crossing=0
-                #i += 1
-                #if i==len(actions):
-                    #break
+   
                 if done:
                     break
-          
-            #if env.reached == 1:
-            #for current_state, action, reward, new_state, done in up_memory:
-                #agent.update_replay_memory((current_state, action, reward, new_state, done))
         
             print("EPISODE {} REWARD IS: {}".format(episode, episode_reward))
             
             # End of episode - destroy agents
             for actor in env.actor_list:
                 actor.destroy()
-                
-            for actor in actor_list:
-                actor.destroy()
-                
+            
     
             # Append episode reward to a list and log stats (every given number of episodes)
             ep_rewards.append(episode_reward)
@@ -810,7 +819,7 @@ if __name__ == '__main__':
     
                 # Save model, but only when min reward is greater or equal a set value
                 if min_reward >= MIN_REWARD:
-                    agent.model.save(f'{path}/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+                    agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
     
             # Decay epsilon
             if epsilon > MIN_EPSILON:
@@ -823,4 +832,4 @@ if __name__ == '__main__':
     # Set termination flag for training thread and wait for it to finish
     agent.terminate = True
     trainer_thread.join()
-    agent.model.save(f'{path}/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
+    agent.model.save(f'models/{MODEL_NAME}__{max_reward:_>7.2f}max_{average_reward:_>7.2f}avg_{min_reward:_>7.2f}min__{int(time.time())}.model')
